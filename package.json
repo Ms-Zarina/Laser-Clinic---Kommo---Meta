@@ -1,0 +1,15 @@
+{
+  "name": "laser-clinic-kommo-meta-backend",
+  "version": "1.0.0",
+  "description": "Laser Clinic — Kommo to Meta Conversions API backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.16.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2"
+  }
+}
