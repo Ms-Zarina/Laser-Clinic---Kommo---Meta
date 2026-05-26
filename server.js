@@ -50,7 +50,7 @@ async function sendMetaEvent({ eventName, email, phone, leadId }) {
         }
       }
     ],
-    // test_event_code: process.env.META_TEST_EVENT_CODE,
+    test_event_code: process.env.META_TEST_EVENT_CODE,
     access_token: process.env.META_ACCESS_TOKEN
   };
 
