@@ -7,6 +7,33 @@ require("dotenv").config();
 
 const app = express();
 
+// Trust the reverse proxy (Nginx) so req.ip reflects the real client IP
+app.set("trust proxy", true);
+
+const REQUIRED_ENV = [
+  "META_PIXEL_ID",
+  "META_ACCESS_TOKEN",
+  "KOMMO_SUBDOMAIN",
+  "KOMMO_ACCESS_TOKEN",
+  "THINKING_STATUS_ID",
+  "BOOKING_STATUS_ID",
+  "SUCCESSFULLY_STATUS_ID"
+];
+
+function getMissingEnv() {
+  return REQUIRED_ENV.filter((key) => !process.env[key]);
+}
+
+const missingEnvAtStartup = getMissingEnv();
+if (missingEnvAtStartup.length > 0) {
+  console.warn(
+    "WARNING: missing required environment variables:",
+    missingEnvAtStartup.join(", ")
+  );
+} else {
+  console.log("Environment variables loaded OK");
+}
+
 function getMetaEventNameByStatus(statusId) {
   const map = {
     [String(process.env.THINKING_STATUS_ID)]: "Lead",
@@ -29,8 +56,111 @@ function sha256(value) {
     .digest("hex");
 }
 
-async function sendMetaEvent({ eventName, email, phone, leadId }) {
+// Extract the real client IP from proxy headers, falling back to req.ip
+function getClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    return String(xff).split(",")[0].trim() || null;
+  }
+
+  const xri = req.headers["x-real-ip"];
+  if (xri) {
+    return String(xri).trim() || null;
+  }
+
+  return req.ip || null;
+}
+
+function getUserAgent(req) {
+  return req.headers["user-agent"] || null;
+}
+
+// Build a Meta user_data object: hash PII params, keep technical params raw,
+// and never include empty values (better Event Match Quality, no empty arrays).
+function buildUserData({
+  email,
+  phone,
+  firstName,
+  lastName,
+  city,
+  country,
+  externalId,
+  clientIpAddress,
+  clientUserAgent,
+  fbp,
+  fbc
+}) {
+  const userData = {};
+
+  // Hashed (SHA-256) parameters
+  if (email) userData.em = [sha256(email)];
+  if (phone) userData.ph = [sha256(phone)];
+  if (firstName) userData.fn = [sha256(firstName)];
+  if (lastName) userData.ln = [sha256(lastName)];
+  if (city) userData.ct = [sha256(city)];
+  if (country) userData.country = [sha256(country)];
+  if (externalId) userData.external_id = [sha256(String(externalId))];
+
+  // Non-hashed (raw) parameters
+  if (clientIpAddress) userData.client_ip_address = clientIpAddress;
+  if (clientUserAgent) userData.client_user_agent = clientUserAgent;
+  if (fbp) userData.fbp = fbp;
+  if (fbc) userData.fbc = fbc;
+
+  return userData;
+}
+
+// Safe logging: only presence flags, never PII (email/phone/name) or tokens.
+function logUserDataPresence(eventName, leadId, userData) {
+  console.log("META MATCH PARAMS:", {
+    eventName,
+    leadId: leadId || null,
+    em: !!userData.em,
+    ph: !!userData.ph,
+    fn: !!userData.fn,
+    ln: !!userData.ln,
+    ct: !!userData.ct,
+    country: !!userData.country,
+    external_id: !!userData.external_id,
+    client_ip_address: !!userData.client_ip_address,
+    client_user_agent: !!userData.client_user_agent,
+    fbp: !!userData.fbp,
+    fbc: !!userData.fbc
+  });
+}
+
+async function sendMetaEvent({
+  eventName,
+  leadId,
+  email,
+  phone,
+  firstName,
+  lastName,
+  city,
+  country,
+  externalId,
+  clientIpAddress,
+  clientUserAgent,
+  fbp,
+  fbc
+}) {
   const url = `https://graph.facebook.com/v20.0/${process.env.META_PIXEL_ID}/events`;
+
+  const userData = buildUserData({
+    email,
+    phone,
+    firstName,
+    lastName,
+    city,
+    country,
+    externalId,
+    clientIpAddress,
+    clientUserAgent,
+    fbp,
+    fbc
+  });
+
+  logUserDataPresence(eventName, leadId, userData);
 
   const payload = {
     data: [
@@ -38,10 +168,7 @@ async function sendMetaEvent({ eventName, email, phone, leadId }) {
         event_name: eventName,
         event_time: Math.floor(Date.now() / 1000),
         action_source: "system_generated",
-        user_data: {
-          em: email ? [sha256(email)] : [],
-          ph: phone ? [sha256(phone)] : []
-        },
+        user_data: userData,
         custom_data: {
           currency: "CZK",
           value: 1,
@@ -50,9 +177,13 @@ async function sendMetaEvent({ eventName, email, phone, leadId }) {
         }
       }
     ],
-    test_event_code: process.env.META_TEST_EVENT_CODE,
     access_token: process.env.META_ACCESS_TOKEN
   };
+
+  // Only attach the test code when explicitly set (avoid sending undefined)
+  if (process.env.META_TEST_EVENT_CODE) {
+    payload.test_event_code = process.env.META_TEST_EVENT_CODE;
+  }
 
   const response = await fetch(url, {
     method: "POST",
@@ -119,10 +250,56 @@ function extractEmailAndPhone(contact) {
   return { email, phone };
 }
 
+// Read a Kommo custom field value by its numeric field_id
+function getCustomFieldValueById(entity, fieldId) {
+  if (!fieldId) return null;
+
+  const fields = entity?.custom_fields_values || [];
+
+  for (const field of fields) {
+    if (String(field.field_id) === String(fieldId)) {
+      return field.values?.[0]?.value || null;
+    }
+  }
+
+  return null;
+}
+
+// Enrich contact data for Meta Event Match Quality (does not change the
+// existing email/phone extraction, only adds optional extra parameters).
+function extractContactData(contact) {
+  const { email, phone } = extractEmailAndPhone(contact);
+
+  let firstName = contact?.first_name || null;
+  let lastName = contact?.last_name || null;
+
+  if (!firstName && !lastName && contact?.name) {
+    const parts = String(contact.name).trim().split(/\s+/);
+    firstName = parts[0] || null;
+    lastName = parts.length > 1 ? parts.slice(1).join(" ") : null;
+  }
+
+  const city = getCustomFieldValueById(contact, process.env.KOMMO_CITY_FIELD_ID);
+  const country = getCustomFieldValueById(contact, process.env.KOMMO_COUNTRY_FIELD_ID);
+  const fbp = getCustomFieldValueById(contact, process.env.KOMMO_FBP_FIELD_ID);
+  const fbc = getCustomFieldValueById(contact, process.env.KOMMO_FBC_FIELD_ID);
+
+  return { email, phone, firstName, lastName, city, country, fbp, fbc };
+}
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     message: "Kommo → Meta backend is running"
+  });
+});
+
+app.get("/health", (req, res) => {
+  const missing = getMissingEnv();
+  res.status(missing.length === 0 ? 200 : 503).json({
+    status: missing.length === 0 ? "ok" : "degraded",
+    uptime: process.uptime(),
+    missingEnv: missing
   });
 });
 
@@ -196,15 +373,24 @@ app.post("/webhook/test-lead", async (req, res) => {
       lead_id,
       status_id,
       eventName,
-      email,
-      phone
+      hasEmail: !!email,
+      hasPhone: !!phone
     });
 
     const metaResult = await sendMetaEvent({
       eventName,
+      leadId: lead_id,
       email,
       phone,
-      leadId: lead_id
+      firstName: req.body?.first_name || req.body?.fn || null,
+      lastName: req.body?.last_name || req.body?.ln || null,
+      city: req.body?.city || req.body?.ct || null,
+      country: req.body?.country || null,
+      externalId: req.body?.external_id || lead_id || null,
+      clientIpAddress: getClientIp(req),
+      clientUserAgent: getUserAgent(req),
+      fbp: req.body?.fbp || req.query?.fbp || null,
+      fbc: req.body?.fbc || req.query?.fbc || null
     });
 
     res.json({
@@ -407,7 +593,8 @@ app.post("/webhook/kommo", async (req, res) => {
     }
 
     const contactData = await getContactById(contactId);
-    const { email, phone } = extractEmailAndPhone(contactData);
+    const contactInfo = extractContactData(contactData);
+    const { email, phone } = contactInfo;
 
     if (!email && !phone) {
       return res.json({
@@ -421,9 +608,18 @@ app.post("/webhook/kommo", async (req, res) => {
 
     const metaResult = await sendMetaEvent({
       eventName,
+      leadId: lead.id,
       email,
       phone,
-      leadId: lead.id
+      firstName: contactInfo.firstName,
+      lastName: contactInfo.lastName,
+      city: contactInfo.city,
+      country: contactInfo.country,
+      externalId: contactId,
+      clientIpAddress: getClientIp(req),
+      clientUserAgent: getUserAgent(req),
+      fbp: contactInfo.fbp || req.body?.fbp || req.query?.fbp || null,
+      fbc: contactInfo.fbc || req.body?.fbc || req.query?.fbc || null
     });
 
     console.log("META RESULT:");
