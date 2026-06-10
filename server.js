@@ -671,6 +671,19 @@ app.post("/meta/webhook", async (req, res) => {
   });
 });
 
+// Receive-only Altegio webhook.
+// Phase 1: only log the incoming payload and always answer { ok: true }.
+// No Meta / Kommo logic is wired here yet — that is intentional until the
+// real Altegio payload structure has been analysed.
+app.post("/altegio/webhook", (req, res) => {
+  console.log("ALTEGIO WEBHOOK:");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  return res.status(200).json({
+    ok: true
+  });
+});
+
 
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
